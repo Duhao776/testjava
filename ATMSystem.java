@@ -1,3 +1,9 @@
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.util.Base64;
 import java.util.Scanner;
 
 /**
@@ -90,6 +96,17 @@ interface AccountRepository {
      * @return 账户数组
      */
     Account[] findAll();
+
+    /**
+     * 保存账户变更。
+     * 默认实现用于内存存储：账户对象已经在内存中被修改，因此不需要额外动作。
+     * 文件、数据库等持久化实现可以覆盖该方法，把最新账户数据写入外部存储。
+     *
+     * @return 保存成功返回 true，保存失败返回 false
+     */
+    default boolean saveChanges() {
+        return true;
+    }
 }
 
 /**
@@ -101,12 +118,12 @@ class ArrayAccountRepository implements AccountRepository {
     /**
      * 用于真正保存账户对象的数组。
      */
-    private Account[] accounts;
+    protected Account[] accounts;
 
     /**
      * 当前已经存入数组的有效账户数量。
      */
-    private int size;
+    protected int size;
 
     public ArrayAccountRepository(int initialCapacity) {
         if (initialCapacity <= 0) {
@@ -152,7 +169,7 @@ class ArrayAccountRepository implements AccountRepository {
      * 当数组空间不足时进行扩容。
      * 为了符合“使用数组存储”的要求，这里手动创建新数组并复制元素。
      */
-    private void ensureCapacity() {
+    protected void ensureCapacity() {
         if (size < accounts.length) {
             return;
         }
@@ -162,6 +179,151 @@ class ArrayAccountRepository implements AccountRepository {
             newAccounts[i] = accounts[i];
         }
         accounts = newAccounts;
+    }
+}
+
+/**
+ * 基于文件的账户存储实现。
+ * 该类复用 AccountRepository 接口和数组仓库的基础能力，只负责把账户数组加载到文件、保存到文件。
+ */
+class FileAccountRepository extends ArrayAccountRepository {
+    /**
+     * 账户数据文件路径。
+     * 当前使用项目根目录下的 accounts.txt，便于课堂演示和直接查看。
+     */
+    private Path filePath;
+
+    public FileAccountRepository(String fileName, int initialCapacity) {
+        super(initialCapacity);
+        this.filePath = Path.of(fileName);
+        loadFromFile();
+    }
+
+    @Override
+    public boolean addAccount(Account account) {
+        if (account == null || findById(account.getAccountId()) != null) {
+            return false;
+        }
+
+        ensureCapacity();
+        accounts[size] = account;
+        size++;
+
+        if (saveChanges()) {
+            return true;
+        }
+
+        /*
+         * 如果文件保存失败，需要撤回本次开户在内存中的修改。
+         * 这样可以避免界面提示开户失败，但内存里实际已经存在该账户的矛盾状态。
+         */
+        size--;
+        accounts[size] = null;
+        return false;
+    }
+
+    @Override
+    public boolean saveChanges() {
+        try {
+            Path parentPath = filePath.getParent();
+            if (parentPath != null) {
+                Files.createDirectories(parentPath);
+            }
+
+            StringBuilder builder = new StringBuilder();
+            for (int i = 0; i < size; i++) {
+                builder.append(toFileLine(accounts[i])).append(System.lineSeparator());
+            }
+
+            /*
+             * 先写入临时文件，再替换正式文件。
+             * 这样可以降低写入中途失败导致正式账户文件损坏的风险。
+             */
+            Path tempPath = filePath.resolveSibling(filePath.getFileName() + ".tmp");
+            Files.writeString(tempPath, builder.toString(), StandardCharsets.UTF_8);
+            Files.move(tempPath, filePath, StandardCopyOption.REPLACE_EXISTING);
+            return true;
+        } catch (IOException exception) {
+            System.out.println("账户数据保存失败：" + exception.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * 从文件加载账户数据。
+     * 文件不存在时表示首次运行程序，直接使用空账户数组即可。
+     */
+    private void loadFromFile() {
+        if (!Files.exists(filePath)) {
+            return;
+        }
+
+        try {
+            for (String line : Files.readAllLines(filePath, StandardCharsets.UTF_8)) {
+                Account account = fromFileLine(line);
+                if (account == null || findById(account.getAccountId()) != null) {
+                    continue;
+                }
+
+                ensureCapacity();
+                accounts[size] = account;
+                size++;
+            }
+        } catch (IOException exception) {
+            System.out.println("账户数据加载失败：" + exception.getMessage());
+        }
+    }
+
+    /**
+     * 将账户对象转换为一行文本。
+     * 字符串字段使用 Base64 编码，避免姓名、密码中出现分隔符导致解析错误。
+     */
+    private String toFileLine(Account account) {
+        return encode(account.getAccountId())
+            + "\t" + encode(account.getName())
+            + "\t" + encode(account.getPassword())
+            + "\t" + account.getBalance();
+    }
+
+    /**
+     * 将文件中的一行文本还原为账户对象。
+     * 遇到空行或格式错误的数据时返回 null，保证单行坏数据不会影响整个程序启动。
+     */
+    private Account fromFileLine(String line) {
+        if (line == null || line.trim().isEmpty()) {
+            return null;
+        }
+
+        String[] parts = line.split("\t");
+        if (parts.length != 4) {
+            return null;
+        }
+
+        try {
+            return new Account(
+                decode(parts[0]),
+                decode(parts[1]),
+                decode(parts[2]),
+                Double.parseDouble(parts[3])
+            );
+        } catch (IllegalArgumentException exception) {
+            return null;
+        }
+    }
+
+    /**
+     * 对普通字符串进行 Base64 编码，保证文件中的字段分隔稳定。
+     */
+    private String encode(String value) {
+        return Base64.getEncoder().encodeToString(value.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /**
+     * 对 Base64 字符串进行解码，恢复原始账户字段。
+     */
+    private String decode(String value) {
+        byte[] bytes = Base64.getDecoder().decode(value);
+        return new String(bytes, StandardCharsets.UTF_8);
     }
 }
 
@@ -228,7 +390,12 @@ class ATM {
             return "存款金额必须大于 0。";
         }
 
-        account.setBalance(account.getBalance() + amount);
+        double oldBalance = account.getBalance();
+        account.setBalance(oldBalance + amount);
+        if (!repository.saveChanges()) {
+            account.setBalance(oldBalance);
+            return "存款失败，账户数据保存失败。";
+        }
         return "存款成功，当前余额为：" + String.format("%.2f", account.getBalance());
     }
 
@@ -250,7 +417,12 @@ class ATM {
             return "余额不足，取款失败。";
         }
 
-        account.setBalance(account.getBalance() - amount);
+        double oldBalance = account.getBalance();
+        account.setBalance(oldBalance - amount);
+        if (!repository.saveChanges()) {
+            account.setBalance(oldBalance);
+            return "取款失败，账户数据保存失败。";
+        }
         return "取款成功，当前余额为：" + String.format("%.2f", account.getBalance());
     }
 
@@ -281,8 +453,16 @@ class ATM {
             return "余额不足，转账失败。";
         }
 
-        fromAccount.setBalance(fromAccount.getBalance() - amount);
-        targetAccount.setBalance(targetAccount.getBalance() + amount);
+        double oldFromBalance = fromAccount.getBalance();
+        double oldTargetBalance = targetAccount.getBalance();
+
+        fromAccount.setBalance(oldFromBalance - amount);
+        targetAccount.setBalance(oldTargetBalance + amount);
+        if (!repository.saveChanges()) {
+            fromAccount.setBalance(oldFromBalance);
+            targetAccount.setBalance(oldTargetBalance);
+            return "转账失败，账户数据保存失败。";
+        }
         return "转账成功，当前余额为：" + String.format("%.2f", fromAccount.getBalance());
     }
 
@@ -332,10 +512,10 @@ public class ATMSystem {
         Scanner scanner = new Scanner(System.in);
 
         /**
-         * 初始化数组存储仓库。
-         * 后续如果改成文件存储，只需把这里替换为新的实现类即可。
+         * 初始化文件存储仓库。
+         * ATM 依赖的是 AccountRepository 接口，因此这里只替换具体实现类即可完成存储方式切换。
          */
-        AccountRepository repository = new ArrayAccountRepository(5);
+        AccountRepository repository = new FileAccountRepository("accounts.txt", 5);
         ATM atm = new ATM(repository);
 
         /**
