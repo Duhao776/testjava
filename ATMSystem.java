@@ -3,6 +3,12 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
 import java.util.Base64;
 import java.util.Scanner;
 
@@ -328,6 +334,183 @@ class FileAccountRepository extends ArrayAccountRepository {
 }
 
 /**
+ * 基于 SQLite 数据库的账户存储实现。
+ * 该类继续实现 AccountRepository 接口，ATM 业务层无需关心底层是文件还是数据库。
+ */
+class SqliteAccountRepository extends ArrayAccountRepository {
+    /**
+     * SQLite 数据库连接地址。
+     * jdbc:sqlite: 后面跟数据库文件路径，SQLite 会把数据保存在该文件中。
+     */
+    private String databaseUrl;
+
+    public SqliteAccountRepository(String databaseFileName, int initialCapacity) {
+        super(initialCapacity);
+        this.databaseUrl = "jdbc:sqlite:" + databaseFileName;
+        initializeDatabase();
+        loadFromDatabase();
+    }
+
+    @Override
+    public boolean addAccount(Account account) {
+        if (account == null || findById(account.getAccountId()) != null) {
+            return false;
+        }
+
+        ensureCapacity();
+        accounts[size] = account;
+        size++;
+
+        if (saveChanges()) {
+            return true;
+        }
+
+        /*
+         * 数据库保存失败时撤回内存数组中的新增账户。
+         * 这样可以保证内存状态和数据库状态保持一致。
+         */
+        size--;
+        accounts[size] = null;
+        return false;
+    }
+
+    @Override
+    public boolean saveChanges() {
+        /*
+         * 这里采用“先删除再批量插入”的方式保存完整账户快照。
+         * 对当前小型课堂程序来说实现简单，并且能统一处理开户、存款、取款、转账后的持久化。
+         */
+        try (Connection connection = openConnection()) {
+            connection.setAutoCommit(false);
+
+            try (
+                Statement deleteStatement = connection.createStatement();
+                PreparedStatement insertStatement = connection.prepareStatement(
+                    "INSERT INTO accounts (account_id, name, password, balance) VALUES (?, ?, ?, ?)"
+                )
+            ) {
+                deleteStatement.executeUpdate("DELETE FROM accounts");
+
+                for (int i = 0; i < size; i++) {
+                    insertStatement.setString(1, accounts[i].getAccountId());
+                    insertStatement.setString(2, accounts[i].getName());
+                    insertStatement.setString(3, accounts[i].getPassword());
+                    insertStatement.setDouble(4, accounts[i].getBalance());
+                    insertStatement.addBatch();
+                }
+
+                insertStatement.executeBatch();
+                connection.commit();
+                return true;
+            } catch (SQLException exception) {
+                /*
+                 * 事务中任一步失败都回滚，避免数据库只保存了部分账户数据。
+                 * 回滚本身也可能失败，因此单独捕获，保留原始保存失败信息。
+                 */
+                try {
+                    connection.rollback();
+                } catch (SQLException rollbackException) {
+                    System.out.println("账户数据回滚失败：" + rollbackException.getMessage());
+                }
+                System.out.println("账户数据保存失败：" + exception.getMessage());
+                return false;
+            }
+        } catch (SQLException exception) {
+            System.out.println("账户数据库连接失败：" + exception.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * 初始化数据库表结构。
+     * 如果表已经存在，CREATE TABLE IF NOT EXISTS 不会破坏已有账户数据。
+     */
+    private void initializeDatabase() {
+        try (
+            Connection connection = openConnection();
+            Statement statement = connection.createStatement()
+        ) {
+            statement.executeUpdate(
+                "CREATE TABLE IF NOT EXISTS accounts ("
+                    + "account_id TEXT PRIMARY KEY,"
+                    + "name TEXT NOT NULL,"
+                    + "password TEXT NOT NULL,"
+                    + "balance REAL NOT NULL"
+                    + ")"
+            );
+        } catch (SQLException exception) {
+            throw new IllegalStateException("SQLite 数据库初始化失败：" + exception.getMessage(), exception);
+        }
+    }
+
+    /**
+     * 从 SQLite 数据库加载账户数据到内存数组。
+     * 后续查询仍然走 AccountRepository 接口，业务层不需要改变调用方式。
+     */
+    private void loadFromDatabase() {
+        try (
+            Connection connection = openConnection();
+            PreparedStatement statement = connection.prepareStatement(
+                "SELECT account_id, name, password, balance FROM accounts ORDER BY account_id"
+            );
+            ResultSet resultSet = statement.executeQuery()
+        ) {
+            while (resultSet.next()) {
+                Account account = new Account(
+                    resultSet.getString("account_id"),
+                    resultSet.getString("name"),
+                    resultSet.getString("password"),
+                    resultSet.getDouble("balance")
+                );
+
+                ensureCapacity();
+                accounts[size] = account;
+                size++;
+            }
+        } catch (SQLException exception) {
+            throw new IllegalStateException("SQLite 账户数据加载失败：" + exception.getMessage(), exception);
+        }
+    }
+
+    /**
+     * 打开 SQLite 数据库连接。
+     * 代码只依赖 Java 标准 JDBC 接口；运行 SQLite 模式时需要把 sqlite-jdbc 驱动加入 classpath。
+     */
+    private Connection openConnection() throws SQLException {
+        return DriverManager.getConnection(databaseUrl);
+    }
+}
+
+/**
+ * 账户仓库工厂。
+ * 通过启动参数选择存储实现，避免在 ATM 业务类中硬编码文件或数据库细节。
+ */
+class AccountRepositoryFactory {
+    /**
+     * 创建账户仓库。
+     * 参数为 sqlite 时使用 SQLite 数据库存储；参数为 file 或不传参数时使用文件存储。
+     */
+    public static AccountRepository create(String[] args) {
+        String storageType = "file";
+        if (args != null && args.length > 0) {
+            storageType = args[0].trim().toLowerCase();
+        }
+
+        if ("sqlite".equals(storageType) || "db".equals(storageType)) {
+            System.out.println("当前存储方式：SQLite 数据库（atm.db）");
+            return new SqliteAccountRepository("atm.db", 5);
+        }
+
+        if (!"file".equals(storageType)) {
+            System.out.println("未知存储方式：" + storageType + "，已自动使用文件存储。");
+        }
+
+        System.out.println("当前存储方式：文件（accounts.txt）");
+        return new FileAccountRepository("accounts.txt", 5);
+    }
+}
+
+/**
  * ATM 业务类。
  * 该类只负责业务逻辑，不直接关心数据到底来自数组还是文件。
  * 因此后续更换存储方式时，主要替换仓库实现即可。
@@ -512,10 +695,10 @@ public class ATMSystem {
         Scanner scanner = new Scanner(System.in);
 
         /**
-         * 初始化文件存储仓库。
-         * ATM 依赖的是 AccountRepository 接口，因此这里只替换具体实现类即可完成存储方式切换。
+         * 通过工厂创建账户存储对象。
+         * 启动参数传 sqlite 使用数据库存储，传 file 或不传参数使用文件存储。
          */
-        AccountRepository repository = new FileAccountRepository("accounts.txt", 5);
+        AccountRepository repository = AccountRepositoryFactory.create(args);
         ATM atm = new ATM(repository);
 
         /**

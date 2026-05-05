@@ -3,3 +3,7 @@
 
 # ATM 运行时生成的账户数据文件，保留在本地即可。
 accounts.txt
+
+# SQLite 模式生成的本地数据库文件。
+*.db
+*.db-journal
