@@ -7,3 +7,5 @@ accounts.txt
 # SQLite 模式生成的本地数据库文件。
 *.db
 *.db-journal
+.idea
+out

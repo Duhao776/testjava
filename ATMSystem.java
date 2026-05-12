@@ -10,17 +10,24 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URLDecoder;
 import java.net.URLEncoder;
+import java.net.URL;
+import java.net.URLClassLoader;
 import java.sql.Connection;
+import java.sql.Driver;
 import java.sql.DriverManager;
+import java.sql.DriverPropertyInfo;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+import java.sql.SQLFeatureNotSupportedException;
 import java.sql.Statement;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Properties;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.logging.Logger;
 
 /**
  * 账户实体类。
@@ -349,6 +356,19 @@ class FileAccountRepository extends ArrayAccountRepository {
  */
 class SqliteAccountRepository extends ArrayAccountRepository {
     /**
+     * 硬编码 SQLite JDBC 驱动 jar 的本机绝对位置。
+     * 运行程序时即使没有手动添加 classpath，也会优先从这里加载 sqlite-jdbc 驱动。
+     */
+    private static final Path SQLITE_DRIVER_JAR_PATH = Path.of(
+        "./lib/sqlite-jdbc-3.53.0.0.jar"
+    );
+
+    /**
+     * 标记驱动是否已经注册到 DriverManager，避免多次创建仓库时重复注册同一个驱动。
+     */
+    private static boolean sqliteDriverLoaded = false;
+
+    /**
      * SQLite 数据库连接地址。
      * jdbc:sqlite: 后面跟数据库文件路径，SQLite 会把数据保存在该文件中。
      */
@@ -356,6 +376,7 @@ class SqliteAccountRepository extends ArrayAccountRepository {
 
     public SqliteAccountRepository(String databaseFileName, int initialCapacity) {
         super(initialCapacity);
+        ensureSqliteDriverLoaded();
         this.databaseUrl = "jdbc:sqlite:" + databaseFileName;
         initializeDatabase();
         loadFromDatabase();
@@ -484,10 +505,99 @@ class SqliteAccountRepository extends ArrayAccountRepository {
 
     /**
      * 打开 SQLite 数据库连接。
-     * 代码只依赖 Java 标准 JDBC 接口；运行 SQLite 模式时需要把 sqlite-jdbc 驱动加入 classpath。
+     * 驱动已经在仓库构造阶段从硬编码 jar 位置加载，因此这里可以直接通过 DriverManager 建立连接。
      */
     private Connection openConnection() throws SQLException {
         return DriverManager.getConnection(databaseUrl);
+    }
+
+    /**
+     * 从硬编码 jar 路径加载 SQLite JDBC 驱动。
+     * 这里使用反射创建驱动实例，避免源码直接 import org.sqlite.JDBC 导致 javac 编译时依赖第三方 jar。
+     */
+    private static synchronized void ensureSqliteDriverLoaded() {
+        if (sqliteDriverLoaded) {
+            return;
+        }
+
+        Path driverPath = SQLITE_DRIVER_JAR_PATH.toAbsolutePath().normalize();
+        if (!Files.exists(driverPath)) {
+            throw new IllegalStateException("找不到 SQLite JDBC 驱动文件：" + driverPath);
+        }
+
+        try {
+            URL driverUrl = driverPath.toUri().toURL();
+
+            /*
+             * 使用独立类加载器加载 jar 内的 org.sqlite.JDBC。
+             * 父加载器使用当前类加载器，确保 java.sql 等标准类仍由 JDK 提供。
+             */
+            URLClassLoader driverClassLoader = new URLClassLoader(
+                new URL[] {driverUrl},
+                SqliteAccountRepository.class.getClassLoader()
+            );
+            Class<?> driverClass = Class.forName("org.sqlite.JDBC", true, driverClassLoader);
+            Driver driver = (Driver) driverClass.getDeclaredConstructor().newInstance();
+
+            /*
+             * DriverManager 会按调用方类加载器过滤驱动。
+             * 包一层当前源码中的 Driver 代理后，普通 java ATMSystem 启动也能拿到该驱动。
+             */
+            DriverManager.registerDriver(new HardcodedJdbcDriver(driver));
+            sqliteDriverLoaded = true;
+        } catch (Exception exception) {
+            throw new IllegalStateException("SQLite JDBC 驱动加载失败：" + exception.getMessage(), exception);
+        }
+    }
+}
+
+/**
+ * JDBC 驱动代理。
+ * 该类由应用自己的类加载器加载，用来把硬编码 jar 中的 SQLite Driver 安全注册给 DriverManager。
+ */
+class HardcodedJdbcDriver implements Driver {
+    /**
+     * 实际来自 sqlite-jdbc jar 的驱动对象。
+     */
+    private final Driver driver;
+
+    public HardcodedJdbcDriver(Driver driver) {
+        this.driver = driver;
+    }
+
+    @Override
+    public Connection connect(String url, Properties info) throws SQLException {
+        return driver.connect(url, info);
+    }
+
+    @Override
+    public boolean acceptsURL(String url) throws SQLException {
+        return driver.acceptsURL(url);
+    }
+
+    @Override
+    public DriverPropertyInfo[] getPropertyInfo(String url, Properties info) throws SQLException {
+        return driver.getPropertyInfo(url, info);
+    }
+
+    @Override
+    public int getMajorVersion() {
+        return driver.getMajorVersion();
+    }
+
+    @Override
+    public int getMinorVersion() {
+        return driver.getMinorVersion();
+    }
+
+    @Override
+    public boolean jdbcCompliant() {
+        return driver.jdbcCompliant();
+    }
+
+    @Override
+    public Logger getParentLogger() throws SQLFeatureNotSupportedException {
+        return driver.getParentLogger();
     }
 }
 
